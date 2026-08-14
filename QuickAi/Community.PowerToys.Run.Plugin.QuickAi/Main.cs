@@ -1,0 +1,1899 @@
+#nullable enable
+using ManagedCommon;
+using Microsoft.PowerToys.Settings.UI.Library;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using System.Security.Authentication;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media.Imaging;
+using Wox.Plugin;
+
+namespace Community.PowerToys.Run.Plugin.QuickAI
+{
+    public sealed class Main : IPlugin, ISettingProvider, IContextMenu, IDisposable
+    {
+        /// <summary>
+        /// Ensures bundled dependencies (WpfMath, XamlMath.Shared) can be resolved from the plugin directory.
+        /// PowerToys Run loads plugins via Assembly.LoadFrom, which does not probe the plugin folder
+        /// for referenced assemblies that are not part of the host's deps.json graph.
+        /// </summary>
+        static Main()
+        {
+            System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
+            {
+                if (name.Name is not ("WpfMath" or "XamlMath.Shared"))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    // Resolve from the plugin's own directory (where this DLL lives).
+                    var pluginDir = Path.GetDirectoryName(typeof(Main).Assembly.Location);
+                    if (!string.IsNullOrEmpty(pluginDir))
+                    {
+                        var candidate = Path.Combine(pluginDir, name.Name + ".dll");
+                        if (File.Exists(candidate))
+                        {
+                            return ctx.LoadFromAssemblyPath(candidate);
+                        }
+                    }
+
+                    // Fall back to the PowerToys shared-dependency directory (parent of RunPlugins).
+                    if (!string.IsNullOrEmpty(pluginDir))
+                    {
+                        var runPluginsDir = Path.GetDirectoryName(pluginDir.TrimEnd(Path.DirectorySeparatorChar));
+                        var sharedDir = Path.GetDirectoryName(runPluginsDir ?? string.Empty);
+                        if (!string.IsNullOrEmpty(sharedDir))
+                        {
+                            var candidate = Path.Combine(sharedDir, name.Name + ".dll");
+                            if (File.Exists(candidate))
+                            {
+                                return ctx.LoadFromAssemblyPath(candidate);
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore resolution failures; the default loader will surface the original error.
+                }
+
+                return null;
+            };
+        }
+
+        private const string ProviderGroq = "Groq";
+        private const string ProviderTogether = "Together";
+        private const string ProviderFireworks = "Fireworks";
+        private const string ProviderOpenRouter = "OpenRouter";
+        private const string ProviderCohere = "Cohere";
+        private const string ProviderGoogle = "Google";
+        private const string ProviderOllama = "Ollama";
+        private const string ProviderOpenAICompatible = "OpenAI Compatible";
+
+        private const string ProviderOptionKey = "quickai_provider";
+        private const string PrimaryKeyOptionKey = "quickai_primary_key";
+        private const string SecondaryKeyOptionKey = "quickai_secondary_key";
+        private const string ModelOptionKey = "quickai_model";
+        private const string MaxTokensOptionKey = "quickai_max_tokens";
+        private const string TemperatureOptionKey = "quickai_temperature";
+        private const string OllamaHostOptionKey = "quickai_ollama_host";
+        private const string SystemPromptOptionKey = "quickai_system_prompt";
+        private const string AttachScreenshotOptionKey = "quickai_attach_screenshot";
+        private const string CustomCommandsOptionKey = "quickai_custom_commands";
+        private const string DefaultOllamaHost = "http://localhost:11434";
+
+        // Built-in quick commands (prefix /)
+        private static readonly List<(string Name, string Prompt, string Description)> BuiltInCommands = new()
+        {
+            ("/read", "Read and extract all text from this image", "📸 Read text from clipboard image"),
+            ("/explain", "Explain this code step by step", "💻 Explain code from clipboard image"),
+            ("/summarize", "Summarize the following content concisely", "📝 Summarize text or content"),
+            ("/translate", "Translate the following to English", "🌍 Translate to English"),
+            ("/fix", "Find and fix bugs in this code", "🐛 Fix bugs in code"),
+        };
+
+        private const string DefaultModelName = "llama-3.1-8b-instant";
+        private const int DefaultMaxTokens = 128;
+        private const double DefaultTemperature = 0.2d;
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+
+        // Configurable timeout settings
+        private const int DefaultTimeoutSeconds = 8;
+        private const int MinTimeoutSeconds = 3;
+        private const int MaxTimeoutSeconds = 30;
+
+        // The Result Window handles streaming display
+        private ResultsWindow? _resultsWindow;
+
+        private static readonly List<string> SupportedProviders = new()
+        {
+            ProviderGroq,
+            ProviderTogether,
+            ProviderFireworks,
+            ProviderOpenRouter,
+            ProviderCohere,
+            ProviderGoogle,
+            ProviderOllama,
+            ProviderOpenAICompatible
+        };
+
+        private static readonly IReadOnlyDictionary<string, ProviderConfiguration> ProviderConfigurations =
+            new Dictionary<string, ProviderConfiguration>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ProviderGroq] = new("https://api.groq.com/openai/v1/chat/completions", ProviderSchemaType.OpenAI),
+                [ProviderTogether] = new("https://api.together.xyz/v1/chat/completions", ProviderSchemaType.OpenAI),
+                [ProviderFireworks] = new("https://api.fireworks.ai/inference/v1/chat/completions", ProviderSchemaType.OpenAI),
+                [ProviderOpenRouter] = new("https://openrouter.ai/api/v1/chat/completions", ProviderSchemaType.OpenAI),
+                [ProviderCohere] = new("https://api.cohere.com/v1/chat", ProviderSchemaType.Cohere),
+                [ProviderGoogle] = new("https://generativelanguage.googleapis.com/v1beta", ProviderSchemaType.Google),
+                [ProviderOllama] = new("http://localhost:11434/v1/chat/completions", ProviderSchemaType.OpenAI),
+                [ProviderOpenAICompatible] = new("http://localhost/v1/chat/completions", ProviderSchemaType.OpenAI)
+            };
+
+        private static readonly HttpClient HttpClient = CreateHttpClient();
+
+        private readonly object _sessionGate = new();
+
+        private PluginInitContext? _context;
+        private string _iconPath = string.Empty;
+        private bool _disposed;
+
+        private string _provider = ProviderGroq;
+        private string? _primaryApiKey;
+        private string? _secondaryApiKey;
+        private string _modelName = DefaultModelName;
+        private int _maxTokens = DefaultMaxTokens;
+        private double _temperature = DefaultTemperature;
+        private int _timeoutSeconds = DefaultTimeoutSeconds;
+        private string _ollamaHost = DefaultOllamaHost;
+        private string _systemPrompt = string.Empty;
+        private bool _attachScreenshot = false;
+        private string _customCommandsRaw = string.Empty;
+        private List<(string Name, string Prompt, string Description)> _userCommands = new();
+
+        private StreamingSession? _session;
+        private bool _uiRefreshPending;
+        private string _pendingPrompt = string.Empty;
+
+        /// <summary>
+        /// ID of the plugin.
+        /// </summary>
+        public static string PluginID => "420129A62ECA49848C5C7CA229BFD22C";
+
+        /// <summary>
+        /// Name of the plugin.
+        /// </summary>
+        public string Name => "QuickAI";
+
+        /// <summary>
+        /// Description of the plugin.
+        /// </summary>
+        public string Description => "Ask questions with streaming AI responses from multiple providers.";
+
+        /// <summary>
+        /// Initialize the plugin with the given <see cref="PluginInitContext"/>.
+        /// </summary>
+        /// <param name="context">The <see cref="PluginInitContext"/> for this plugin.</param>
+        public void Init(PluginInitContext context)
+        {
+            _context = context ?? throw new ArgumentNullException(nameof(context));
+            _context.API.ThemeChanged += OnThemeChanged;
+            UpdateIconPath(_context.API.GetCurrentTheme());
+        }
+
+        /// <summary>
+        /// Return a filtered list, based on the given query.
+        /// </summary>
+        /// <param name="query">The query to filter the list.</param>
+        /// <returns>A filtered list, can be empty when nothing was found.</returns>
+        public List<Result> Query(Query query)
+        {
+            if (query is null)
+            {
+                return new List<Result>();
+            }
+
+            var rawQuery = query.RawQuery ?? string.Empty;
+            var search = (query.Search ?? string.Empty).Trim();
+
+            lock (_sessionGate)
+            {
+                if (_uiRefreshPending && _session is not null && string.Equals(_session.RawQuery, rawQuery, StringComparison.Ordinal))
+                {
+                    _uiRefreshPending = false;
+                    return new List<Result> { _session.BuildResult(_iconPath, _provider, _modelName) };
+                }
+
+                if (_session is not null && !string.Equals(_session.RawQuery, rawQuery, StringComparison.Ordinal))
+                {
+                    _session.Cancel();
+                    _session = null;
+                }
+
+                if (string.IsNullOrEmpty(search))
+                {
+                    _pendingPrompt = string.Empty;
+                    var emptyResults = new List<Result>
+                    {
+                        BuildInfoResult(
+                            "Type your question after \"ai\"",
+                            "Example: ai explain recursion in simple terms.  |  Type / for quick commands")
+                    };
+                    return emptyResults;
+                }
+
+                if (!HasConfiguredApiKey())
+                {
+                    return new List<Result>
+                    {
+                        BuildInfoResult(
+                            "API key required",
+                            "Open PowerToys Settings → PowerToys Run → QuickAI to configure keys.")
+                    };
+                }
+
+                // If session is active, show streaming result
+                if (_session is not null)
+                {
+                    return new List<Result> { _session.BuildResult(_iconPath, _provider, _modelName) };
+                }
+
+                // Quick commands: show matching commands when input starts with /
+                if (search.StartsWith("/", StringComparison.Ordinal))
+                {
+                    var commandResults = BuildQuickCommandResults(rawQuery, search);
+                    if (commandResults.Count > 0)
+                    {
+                        return commandResults;
+                    }
+                }
+
+                // Otherwise, show prompt ready to submit
+                _pendingPrompt = search;
+                var displayTitle = search.Length > 100 ? search.Substring(0, 97) + "..." : search;
+                var imageHint = _attachScreenshot ? " · 📎 Clipboard image" : string.Empty;
+                return new List<Result>
+                {
+                    new Result
+                    {
+                        Title = displayTitle,
+                        SubTitle = $"Press Enter to ask {_provider} · {_modelName}{imageHint}",
+                        IcoPath = _iconPath,
+                        Score = 100,
+                        Action = _ =>
+                        {
+                            StartQuery(rawQuery, search);
+                            return false;
+                        }
+                    }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Return a list context menu entries for a given <see cref="Result"/> (shown at the right side of the result).
+        /// </summary>
+        /// <param name="selectedResult">The <see cref="Result"/> for the list with context menu entries.</param>
+        /// <returns>A list context menu entries.</returns>
+        public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
+        {
+            if (selectedResult?.ContextData is string responseText && !string.IsNullOrWhiteSpace(responseText))
+            {
+                return new List<ContextMenuResult>
+                {
+                    new ContextMenuResult
+                    {
+                        PluginName = Name,
+                        Title = "Show full response (Enter)",
+                        FontFamily = "Segoe MDL2 Assets",
+                        Glyph = "\xE8A7", // View icon
+                        AcceleratorKey = Key.Enter,
+                        AcceleratorModifiers = ModifierKeys.None,
+                        Action = _ =>
+                        {
+                            lock (_sessionGate)
+                            {
+                                if (_session != null)
+                                {
+                                    OpenResultsWindow(_session);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        },
+                    },
+                    new ContextMenuResult
+                    {
+                        PluginName = Name,
+                        Title = "Copy response (Ctrl+C)",
+                        FontFamily = "Segoe MDL2 Assets",
+                        Glyph = "\xE8C8", // Copy icon
+                        AcceleratorKey = Key.C,
+                        AcceleratorModifiers = ModifierKeys.Control,
+                        Action = _ =>
+                        {
+                            try
+                            {
+                                Clipboard.SetText(responseText);
+                                ShowNotification("Response copied to clipboard.");
+                                return true;
+                            }
+                            catch
+                            {
+                                ShowInfo("QuickAI", "Unable to copy response.");
+                                return false;
+                            }
+                        },
+                    },
+                    new ContextMenuResult
+                    {
+                        PluginName = Name,
+                        Title = "Restart query (Ctrl+R)",
+                        FontFamily = "Segoe MDL2 Assets",
+                        Glyph = "\xE72C", // Refresh icon
+                        AcceleratorKey = Key.R,
+                        AcceleratorModifiers = ModifierKeys.Control,
+                        Action = _ =>
+                        {
+                            lock (_sessionGate)
+                            {
+                                _session?.Restart();
+                            }
+                            return true;
+                        },
+                    }
+                };
+            }
+
+            return new List<ContextMenuResult>();
+        }
+
+        public IEnumerable<PluginAdditionalOption> AdditionalOptions
+        {
+            get
+            {
+                lock (_sessionGate)
+                {
+                    var providerIndex = Math.Max(0, SupportedProviders.IndexOf(_provider));
+                    return new List<PluginAdditionalOption>
+                    {
+                        new()
+                        {
+                            Key = ProviderOptionKey,
+                            DisplayLabel = "API Provider",
+                            DisplayDescription = "Select the AI provider used for requests.",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Combobox,
+                            ComboBoxItems = SupportedProviders
+                                .Select((name, index) => new KeyValuePair<string, string>(name, index.ToString(CultureInfo.InvariantCulture)))
+                                .ToList(),
+                            ComboBoxValue = providerIndex
+                        },
+                        new()
+                        {
+                            Key = PrimaryKeyOptionKey,
+                            DisplayLabel = "Primary API Key",
+                            DisplayDescription = "Main provider key (stored as plain text in PowerToys settings).",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _primaryApiKey ?? string.Empty
+                        },
+                        new()
+                        {
+                            Key = SecondaryKeyOptionKey,
+                            DisplayLabel = "Secondary API Key",
+                            DisplayDescription = "Optional fallback key used when the primary key fails.",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _secondaryApiKey ?? string.Empty
+                        },
+                        new()
+                        {
+                            Key = ModelOptionKey,
+                            DisplayLabel = "Model Name",
+                            DisplayDescription = "Model identifier sent to the provider.",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _modelName
+                        },
+                        new()
+                        {
+                            Key = MaxTokensOptionKey,
+                            DisplayLabel = "Max Tokens",
+                            DisplayDescription = "Limits response length. Use 0 or -1 for unlimited (model decides).",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+                            NumberValue = _maxTokens,
+                            NumberBoxMin = -1,
+                            NumberBoxMax = 128000,
+                            NumberBoxSmallChange = 16,
+                            NumberBoxLargeChange = 128
+                        },
+                        new()
+                        {
+                            Key = TemperatureOptionKey,
+                            DisplayLabel = "Temperature",
+                            DisplayDescription = "Controls response creativity (0.0 = focused, 2.0 = creative).",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+                            NumberValue = _temperature,
+                            NumberBoxMin = 0.0,
+                            NumberBoxMax = 2.0,
+                            NumberBoxSmallChange = 0.1,
+                            NumberBoxLargeChange = 0.5
+                        },
+                        new()
+                        {
+                            Key = "quickai_timeout",
+                            DisplayLabel = "Request Timeout (seconds)",
+                            DisplayDescription = "Maximum time to wait for response. Lower = faster failure detection.",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+                            NumberValue = _timeoutSeconds,
+                            NumberBoxMin = MinTimeoutSeconds,
+                            NumberBoxMax = MaxTimeoutSeconds,
+                            NumberBoxSmallChange = 1,
+                            NumberBoxLargeChange = 5
+                        },
+                        new()
+                        {
+                            Key = OllamaHostOptionKey,
+                            DisplayLabel = "Custom Base URL (Ollama / OpenAI Compatible)",
+                            DisplayDescription = "Base URL (e.g. https://api.deepseek.com or http://localhost:11434).",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _ollamaHost
+                        },
+                        new()
+                        {
+                            Key = SystemPromptOptionKey,
+                            DisplayLabel = "System Prompt",
+                            DisplayDescription = "Optional instructions sent before every query (e.g. 'You are a concise assistant').",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _systemPrompt
+                        },
+                        new()
+                        {
+                            Key = AttachScreenshotOptionKey,
+                            DisplayLabel = "Attach Clipboard Image",
+                            DisplayDescription = "When enabled, sends the current clipboard image with your query (requires a vision-capable model).",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Checkbox,
+                            Value = _attachScreenshot
+                        },
+                        new()
+                        {
+                            Key = CustomCommandsOptionKey,
+                            DisplayLabel = "Custom Quick Commands",
+                            DisplayDescription = "Add your own /commands. Format: /name=prompt; /name2=prompt2  (e.g. /review=Review this code for best practices; /eli5=Explain like I'm 5)",
+                            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
+                            TextValue = _customCommandsRaw
+                        }
+                    };
+                }
+            }
+        }
+
+        public void UpdateSettings(PowerLauncherPluginSettings settings)
+        {
+            lock (_sessionGate)
+            {
+                if (settings?.AdditionalOptions is null)
+                {
+                    ResetToDefaults();
+                }
+                else
+                {
+                    ApplySettings(settings.AdditionalOptions);
+                }
+
+                if (_session is not null)
+                {
+                    _session.Cancel();
+                    _session = null;
+                }
+            }
+        }
+
+        public Control? CreateSettingPanel() => null;
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Wrapper method for <see cref="Dispose()"/> that dispose additional objects and events form the plugin itself.
+        /// </summary>
+        /// <param name="disposing">Indicate that the plugin is disposed.</param>
+        private void Dispose(bool disposing)
+        {
+            if (_disposed || !disposing)
+            {
+                return;
+            }
+
+            if (_context?.API != null)
+            {
+                _context.API.ThemeChanged -= OnThemeChanged;
+            }
+
+            lock (_sessionGate)
+            {
+                _session?.Dispose();
+                _session = null;
+            }
+
+            _disposed = true;
+        }
+
+        // open or activate the results window
+        private void OpenResultsWindow(StreamingSession session)
+        {
+            // clear the query box if user open the results window
+            _context?.API?.ChangeQuery(string.Empty, false);
+
+            Application.Current.Dispatcher.Invoke(() =>
+            {
+                if (_resultsWindow == null || !_resultsWindow.IsLoaded)
+                {
+                    _resultsWindow = new ResultsWindow();
+                    _resultsWindow.Closed += (_, _) => _resultsWindow = null;
+                    _resultsWindow.FollowUpRequested += AskFollowUp;
+                    _resultsWindow.Show();
+                }
+                else
+                {
+                    _resultsWindow.Activate();
+                }
+
+                // Apply current PowerToys theme to window (best-effort)
+                try
+                {
+                    var theme = _context?.API?.GetCurrentTheme() ?? Theme.Dark;
+                    _resultsWindow?.ApplyTheme(theme == Theme.Light || theme == Theme.HighContrastWhite ? "light" : "dark");
+                }
+                catch
+                {
+                }
+
+                // initialize with current snapshot
+                if (_resultsWindow != null)
+                {
+                    _resultsWindow.SetFullText(session.SnapshotResponse());
+                }
+
+                // subscribe to subsequent streaming updates
+                // first unsubscribe old subscription to prevent duplicates
+                session.TokenReceived -= OnTokenReceived;
+                session.TokenReceived += OnTokenReceived;
+
+                // If already completed, notify the window
+                if (session.HasCompleted)
+                {
+                    _resultsWindow?.SetStreamingComplete();
+                }
+            });
+        }
+
+        // handle streaming updates
+        private void OnTokenReceived(string text)
+        {
+            _resultsWindow?.AppendText(text);
+        }
+
+        /// <summary>
+        /// Handle a follow-up question submitted from the results window.
+        /// Carries the conversation history into the new request and streams
+        /// the answer into the same window.
+        /// </summary>
+        private void AskFollowUp(string question)
+        {
+            if (string.IsNullOrWhiteSpace(question))
+            {
+                return;
+            }
+
+            lock (_sessionGate)
+            {
+                if (_session is null)
+                {
+                    return;
+                }
+
+                _session.StartFollowUp(question.Trim());
+            }
+
+            // Show the user's question in the window, then let streaming fill in the answer.
+            _resultsWindow?.AppendUserQuestion(question.Trim());
+            _resultsWindow?.SetStatusText(" · Thinking...");
+            _resultsWindow?.SetFollowUpBusy(true);
+            TriggerRefresh(_session?.RawQuery ?? string.Empty);
+        }
+
+        // notify window that streaming is complete
+        private void NotifyStreamingComplete()
+        {
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                _resultsWindow?.SetStreamingComplete();
+                _resultsWindow?.SetFollowUpBusy(false);
+                _resultsWindow?.SetStatusText(string.Empty);
+            });
+        }
+
+        private static HttpClient CreateHttpClient()
+        {
+            var handler = new SocketsHttpHandler
+            {
+                // HTTP/2 optimization
+                EnableMultipleHttp2Connections = true,
+
+                // Connection pooling
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+                MaxConnectionsPerServer = 10,
+
+                // Compression (was already present)
+                AutomaticDecompression = DecompressionMethods.Brotli |
+                                         DecompressionMethods.Deflate |
+                                         DecompressionMethods.GZip,
+
+                // Security optimization
+                SslOptions = new System.Net.Security.SslClientAuthenticationOptions
+                {
+                    EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 |
+                                          System.Security.Authentication.SslProtocols.Tls13
+                },
+
+                // Performance tweak
+                UseCookies = false  // Not needed for API calls
+            };
+
+            var client = new HttpClient(handler)
+            {
+                Timeout = Timeout.InfiniteTimeSpan,
+
+                // HTTP/2 by default
+                DefaultRequestVersion = new Version(2, 0),
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher
+            };
+
+            return client;
+        }
+
+        private void BeginStreaming(StreamingSession session)
+        {
+            var configuration = CaptureConfiguration();
+
+            _ = Task.Run(async () =>
+            {
+                await StreamWithConfigurationAsync(session, configuration).ConfigureAwait(false);
+            });
+        }
+
+        private async Task StreamWithConfigurationAsync(StreamingSession session, ConfigurationSnapshot configuration)
+        {
+            if (!ProviderConfigurations.TryGetValue(configuration.Provider, out var providerConfiguration))
+            {
+                session.SetError($"Unsupported provider: {configuration.Provider}");
+                TriggerRefresh(session.RawQuery);
+                return;
+            }
+
+            session.SetStatus($"Requesting from {configuration.Provider}...");
+            TriggerRefresh(session.RawQuery);
+
+            var prompt = session.SnapshotPrompt();
+            var apiKeys = EnumerateApiKeys(configuration.PrimaryApiKey, configuration.SecondaryApiKey).ToList();
+
+            // Ollama doesn't require an API key - add a dummy entry to allow the request to proceed
+            var isOllama = string.Equals(configuration.Provider, ProviderOllama, StringComparison.OrdinalIgnoreCase);
+            if (apiKeys.Count == 0)
+            {
+                if (isOllama)
+                {
+                    apiKeys.Add(new ApiKeyCandidate(string.Empty, ApiKeyKind.Primary));
+                }
+                else
+                {
+                    session.SetError("Configure an API key to use this provider.");
+                    TriggerRefresh(session.RawQuery);
+                    return;
+                }
+            }
+
+            foreach (var candidate in apiKeys)
+            {
+                if (session.Token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                var history = session.SnapshotHistory();
+
+                try
+                {
+                    await foreach (var chunk in ExecuteStreamingRequestAsync(
+                        providerConfiguration,
+                        configuration,
+                        prompt,
+                        candidate.Key,
+                        session.ImageBase64,
+                        history,
+                        session.Token).ConfigureAwait(false))
+                    {
+                        session.Append(chunk);
+                        TriggerRefresh(session.RawQuery);
+                    }
+
+                    session.MarkCompleted();
+                    TriggerRefresh(session.RawQuery);
+                    return;
+                }
+                catch (AuthenticationException authEx)
+                {
+                    if (candidate.Kind == ApiKeyKind.Primary && apiKeys.Any(k => k.Kind == ApiKeyKind.Secondary))
+                    {
+                        session.SetStatus("Primary key failed. Trying secondary key...");
+                        TriggerRefresh(session.RawQuery);
+                        continue;
+                    }
+
+                    session.SetError(authEx.Message);
+                    TriggerRefresh(session.RawQuery);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    session.SetError($"Request failed: {ex.Message}");
+                    TriggerRefresh(session.RawQuery);
+                }
+
+                if (!session.HasCompleted)
+                {
+                    return;
+                }
+            }
+
+            if (!session.HasCompleted)
+            {
+                session.SetError("All configured API keys failed. Verify credentials and provider status.");
+                TriggerRefresh(session.RawQuery);
+            }
+        }
+
+        private async IAsyncEnumerable<string> ExecuteStreamingRequestAsync(
+            ProviderConfiguration providerConfiguration,
+            ConfigurationSnapshot configuration,
+            string prompt,
+            string apiKey,
+            string? imageBase64,
+            IReadOnlyList<(string Role, string Content)>? history,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            using var request = BuildHttpRequest(providerConfiguration, configuration, prompt, apiKey, imageBase64, history);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(configuration.TimeoutSeconds));
+
+            using var response = await HttpClient
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token)
+                .ConfigureAwait(false);
+
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                throw new AuthenticationException("Authentication failed for the configured API key.");
+            }
+
+            response.EnsureSuccessStatusCode();
+
+            await foreach (var token in ParseStreamAsync(response, providerConfiguration, timeoutCts, configuration.TimeoutSeconds, cancellationToken).ConfigureAwait(false))
+            {
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(configuration.TimeoutSeconds));
+                yield return token;
+            }
+        }
+
+        private async IAsyncEnumerable<string> ParseStreamAsync(
+            HttpResponseMessage response,
+            ProviderConfiguration configuration,
+            CancellationTokenSource timeoutSource,
+            int timeoutSeconds,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            using var reader = new StreamReader(stream);
+
+            while (!reader.EndOfStream)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                if (!line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var payload = line[5..].Trim();
+                if (string.IsNullOrEmpty(payload))
+                {
+                    continue;
+                }
+
+                if (payload.Equals("[DONE]", StringComparison.OrdinalIgnoreCase))
+                {
+                    yield break;
+                }
+
+                string? token = null;
+
+                try
+                {
+                    using var document = JsonDocument.Parse(payload);
+                    token = configuration.SchemaType switch
+                    {
+                        ProviderSchemaType.OpenAI => ExtractOpenAiDelta(document.RootElement),
+                        ProviderSchemaType.Cohere => ExtractCohereDelta(document.RootElement),
+                        ProviderSchemaType.Google => ExtractGoogleDelta(document.RootElement),
+                        _ => null
+                    };
+                }
+                catch (JsonException)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(token))
+                {
+                    timeoutSource.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+                    yield return token;
+                }
+            }
+        }
+
+        private HttpRequestMessage BuildHttpRequest(
+            ProviderConfiguration providerConfiguration,
+            ConfigurationSnapshot configuration,
+            string prompt,
+            string apiKey,
+            string? imageBase64 = null,
+            IReadOnlyList<(string Role, string Content)>? history = null)
+        {
+            string endpoint = providerConfiguration.Endpoint;
+            string json;
+
+            // Override endpoint for Ollama with custom host
+            if (string.Equals(configuration.Provider, ProviderOllama, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(configuration.Provider, ProviderOpenAICompatible, StringComparison.OrdinalIgnoreCase))
+            {
+                endpoint = $"{configuration.OllamaHost.TrimEnd('/')}/v1/chat/completions";
+            }
+
+            // Check if max_tokens should be included (<=0 means unlimited/omit)
+            var includeMaxTokens = configuration.MaxTokens > 0;
+            var hasSystemPrompt = !string.IsNullOrWhiteSpace(configuration.SystemPrompt);
+            var hasImage = !string.IsNullOrEmpty(imageBase64);
+
+            // Build request based on provider schema type
+            switch (providerConfiguration.SchemaType)
+            {
+                case ProviderSchemaType.Google:
+                    // Google uses model in URL, API key in header, and alt=sse for streaming
+                    endpoint = $"{providerConfiguration.Endpoint}/models/{configuration.Model}:streamGenerateContent?alt=sse";
+                    object googleGenerationConfig = includeMaxTokens
+                        ? new { temperature = configuration.Temperature, maxOutputTokens = configuration.MaxTokens }
+                        : new { temperature = configuration.Temperature };
+
+                    // Build parts list for user content
+                    var googleParts = new List<object> { new { text = prompt } };
+                    if (hasImage)
+                    {
+                        googleParts.Add(new { inlineData = new { mimeType = "image/png", data = imageBase64 } });
+                    }
+
+                    var googlePayloadDict = new Dictionary<string, object>
+                    {
+                        ["contents"] = new[] { new { parts = googleParts.ToArray() } },
+                        ["generationConfig"] = googleGenerationConfig
+                    };
+
+                    // Google system instruction support
+                    if (hasSystemPrompt)
+                    {
+                        googlePayloadDict["systemInstruction"] = new
+                        {
+                            parts = new[] { new { text = configuration.SystemPrompt } }
+                        };
+                    }
+
+                    json = JsonSerializer.Serialize(googlePayloadDict, new JsonSerializerOptions
+                    {
+                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+                    });
+                    break;
+
+                case ProviderSchemaType.Cohere:
+                    var coherePayload = new Dictionary<string, object>
+                    {
+                        ["model"] = configuration.Model,
+                        ["message"] = prompt,
+                        ["stream"] = true,
+                        ["temperature"] = configuration.Temperature
+                    };
+                    if (includeMaxTokens)
+                    {
+                        coherePayload["max_tokens"] = configuration.MaxTokens;
+                    }
+                    // Cohere uses 'preamble' for system prompt
+                    if (hasSystemPrompt)
+                    {
+                        coherePayload["preamble"] = configuration.SystemPrompt;
+                    }
+                    // Note: Cohere v1/chat does not support image attachments
+                    json = JsonSerializer.Serialize(coherePayload, new JsonSerializerOptions
+                    {
+                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+                    });
+                    break;
+
+                case ProviderSchemaType.OpenAI:
+                default:
+                    // Build messages array
+                    var messages = new List<object>();
+
+                    // System prompt as first message
+                    if (hasSystemPrompt)
+                    {
+                        messages.Add(new { role = "system", content = configuration.SystemPrompt });
+                    }
+
+                    // Conversation history (user/assistant pairs) before the new prompt
+                    if (history is not null)
+                    {
+                        foreach (var (role, content) in history)
+                        {
+                            if (string.Equals(role, "assistant", StringComparison.OrdinalIgnoreCase))
+                            {
+                                messages.Add(new { role = "assistant", content });
+                            }
+                            else
+                            {
+                                messages.Add(new { role = "user", content });
+                            }
+                        }
+                    }
+
+                    // User message with optional image
+                    if (hasImage)
+                    {
+                        // Multimodal content array format for vision models
+                        var contentParts = new List<object>
+                        {
+                            new { type = "text", text = prompt },
+                            new { type = "image_url", image_url = new { url = $"data:image/png;base64,{imageBase64}" } }
+                        };
+                        messages.Add(new { role = "user", content = (object)contentParts });
+                    }
+                    else
+                    {
+                        messages.Add(new { role = "user", content = prompt });
+                    }
+
+                    var openAiPayload = new Dictionary<string, object>
+                    {
+                        ["model"] = configuration.Model,
+                        ["messages"] = messages,
+                        ["stream"] = true,
+                        ["temperature"] = configuration.Temperature
+                    };
+                    if (includeMaxTokens)
+                    {
+                        openAiPayload["max_tokens"] = configuration.MaxTokens;
+                    }
+                    json = JsonSerializer.Serialize(openAiPayload, new JsonSerializerOptions
+                    {
+                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+                    });
+                    break;
+            }
+
+            var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+
+            // Set authentication based on provider
+            if (string.Equals(configuration.Provider, ProviderOllama, StringComparison.OrdinalIgnoreCase))
+            {
+                // Ollama doesn't require authentication
+            }
+            else if (providerConfiguration.SchemaType == ProviderSchemaType.Google)
+            {
+                // Google uses x-goog-api-key header
+                request.Headers.TryAddWithoutValidation("x-goog-api-key", apiKey);
+            }
+            else
+            {
+                // Others use Authorization: Bearer header
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            }
+
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Headers.UserAgent.ParseAdd("PowerToys-QuickAI/1.0");
+            request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+
+            if (string.Equals(configuration.Provider, ProviderOpenRouter, StringComparison.OrdinalIgnoreCase))
+            {
+                request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/microsoft/PowerToys");
+                request.Headers.TryAddWithoutValidation("X-Title", "PowerToys Run QuickAI");
+            }
+
+            request.Content = new StringContent(json, Encoding.UTF8, new MediaTypeHeaderValue("application/json"));
+            return request;
+        }
+
+        private static string? ExtractOpenAiDelta(JsonElement root)
+        {
+            if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0)
+            {
+                return null;
+            }
+
+            var choice = choices[0];
+            if (choice.TryGetProperty("delta", out var delta) && delta.ValueKind == JsonValueKind.Object)
+            {
+                if (delta.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
+                {
+                    return content.GetString();
+                }
+            }
+
+            if (choice.TryGetProperty("message", out var message) && message.TryGetProperty("content", out var messageContent) && messageContent.ValueKind == JsonValueKind.String)
+            {
+                return messageContent.GetString();
+            }
+
+            return null;
+        }
+
+        private static string? ExtractCohereDelta(JsonElement root)
+        {
+            if (root.TryGetProperty("event_type", out var eventType) && eventType.ValueKind == JsonValueKind.String)
+            {
+                var type = eventType.GetString();
+                if (string.Equals(type, "text-generation", StringComparison.OrdinalIgnoreCase) &&
+                    root.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
+                {
+                    return text.GetString();
+                }
+
+                if (string.Equals(type, "stream-end", StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+            }
+
+            if (root.TryGetProperty("text", out var shorthandText) && shorthandText.ValueKind == JsonValueKind.String)
+            {
+                return shorthandText.GetString();
+            }
+
+            return null;
+        }
+
+        private static string? ExtractGoogleDelta(JsonElement root)
+        {
+            // Google AI Studio streaming format: {"candidates":[{"content":{"parts":[{"text":"chunk"}]}}]}
+            if (!root.TryGetProperty("candidates", out var candidates) || candidates.GetArrayLength() == 0)
+            {
+                return null;
+            }
+
+            var candidate = candidates[0];
+            if (!candidate.TryGetProperty("content", out var content))
+            {
+                return null;
+            }
+
+            if (!content.TryGetProperty("parts", out var parts) || parts.GetArrayLength() == 0)
+            {
+                return null;
+            }
+
+            var part = parts[0];
+            if (part.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
+            {
+                return text.GetString();
+            }
+
+            return null;
+        }
+
+        private void UpdateIconPath(Theme theme) => _iconPath = theme == Theme.Light || theme == Theme.HighContrastWhite 
+            ? Path.Combine(_context?.CurrentPluginMetadata?.PluginDirectory ?? string.Empty, "Images", "ai.light.png")
+            : Path.Combine(_context?.CurrentPluginMetadata?.PluginDirectory ?? string.Empty, "Images", "ai.dark.png");
+
+        private void OnThemeChanged(Theme currentTheme, Theme newTheme)
+        {
+            UpdateIconPath(newTheme);
+
+            // Update results window appearance if it's open (pass strict lowercase)
+            try
+            {
+                _resultsWindow?.ApplyTheme(newTheme == Theme.Light || newTheme == Theme.HighContrastWhite ? "light" : "dark");
+            }
+            catch
+            {
+                // ignore errors to avoid affecting host
+            }
+        }
+
+        private void StartQuery(string rawQuery, string search)
+        {
+            // Capture clipboard image on the UI thread before going async
+            var imageBase64 = CaptureClipboardImageBase64();
+
+            lock (_sessionGate)
+            {
+                if (_session is null)
+                {
+                    _session = new StreamingSession(this, rawQuery, search, imageBase64);
+                    _session.Start();
+                }
+            }
+
+            TriggerRefresh(rawQuery);
+        }
+
+        private void TriggerRefresh(string rawQuery)
+        {
+            var api = _context?.API;
+            if (api is null)
+            {
+                return;
+            }
+
+            lock (_sessionGate)
+            {
+                if (_session is null || !string.Equals(_session.RawQuery, rawQuery, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                _uiRefreshPending = true;
+            }
+
+            api.ChangeQuery(rawQuery, true);
+        }
+
+        private bool HasConfiguredApiKey()
+        {
+            lock (_sessionGate)
+            {
+                // Ollama doesn't require an API key
+                if (string.Equals(_provider, ProviderOllama, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                return !string.IsNullOrWhiteSpace(_primaryApiKey) || !string.IsNullOrWhiteSpace(_secondaryApiKey);
+            }
+        }
+
+        private string? CaptureClipboardText()
+        {
+            string? text = null;
+            try
+            {
+                Application.Current?.Dispatcher?.Invoke(() =>
+                {
+                    if (Clipboard.ContainsText())
+                    {
+                        text = Clipboard.GetText()?.Trim();
+                    }
+                });
+            }
+            catch
+            {
+                // Clipboard access can fail silently
+            }
+
+            return string.IsNullOrEmpty(text) ? null : text;
+        }
+
+        private string? CaptureClipboardImageBase64()
+        {
+            if (!_attachScreenshot)
+            {
+                return null;
+            }
+
+            string? base64 = null;
+
+            try
+            {
+                // Clipboard must be accessed on the STA/UI thread
+                Application.Current?.Dispatcher?.Invoke(() =>
+                {
+                    if (Clipboard.ContainsImage())
+                    {
+                        var image = Clipboard.GetImage();
+                        if (image != null)
+                        {
+                            var encoder = new PngBitmapEncoder();
+                            encoder.Frames.Add(BitmapFrame.Create(image));
+                            using var ms = new MemoryStream();
+                            encoder.Save(ms);
+                            base64 = Convert.ToBase64String(ms.ToArray());
+                        }
+                    }
+                });
+            }
+            catch
+            {
+                // Clipboard access can fail silently
+            }
+
+            return base64;
+        }
+
+        private void ResetToDefaults()
+        {
+            _provider = ProviderGroq;
+            _primaryApiKey = null;
+            _secondaryApiKey = null;
+            _modelName = DefaultModelName;
+            _maxTokens = DefaultMaxTokens;
+            _temperature = DefaultTemperature;
+            _timeoutSeconds = DefaultTimeoutSeconds;
+            _ollamaHost = DefaultOllamaHost;
+            _systemPrompt = string.Empty;
+            _attachScreenshot = false;
+            _customCommandsRaw = string.Empty;
+            _userCommands = new();
+        }
+
+        private void ApplySettings(IEnumerable<PluginAdditionalOption> options)
+        {
+            foreach (var option in options)
+            {
+                if (option is null)
+                {
+                    continue;
+                }
+
+                switch (option.Key)
+                {
+                    case ProviderOptionKey:
+                        var index = option.ComboBoxValue;
+                        if (index >= 0 && index < SupportedProviders.Count)
+                        {
+                            _provider = SupportedProviders[index];
+                        }
+                        break;
+                    case PrimaryKeyOptionKey:
+                        _primaryApiKey = string.IsNullOrWhiteSpace(option.TextValue) ? null : option.TextValue.Trim();
+                        break;
+                    case SecondaryKeyOptionKey:
+                        _secondaryApiKey = string.IsNullOrWhiteSpace(option.TextValue) ? null : option.TextValue.Trim();
+                        break;
+                    case ModelOptionKey:
+                        _modelName = string.IsNullOrWhiteSpace(option.TextValue) ? DefaultModelName : option.TextValue.Trim();
+                        break;
+                    case MaxTokensOptionKey:
+                        // Allow -1 or 0 for unlimited, otherwise clamp to valid range
+                        var tokenValue = (int)option.NumberValue;
+                        _maxTokens = tokenValue <= 0 ? tokenValue : Math.Clamp(tokenValue, 1, 128000);
+                        break;
+                    case TemperatureOptionKey:
+                        _temperature = Math.Clamp(option.NumberValue, 0.0, 2.0);
+                        break;
+                    case "quickai_timeout":
+                        _timeoutSeconds = (int)Math.Clamp(
+                            option.NumberValue,
+                            MinTimeoutSeconds,
+                            MaxTimeoutSeconds
+                        );
+                        break;
+                    case OllamaHostOptionKey:
+                        _ollamaHost = string.IsNullOrWhiteSpace(option.TextValue) ? DefaultOllamaHost : option.TextValue.Trim();
+                        break;
+                    case SystemPromptOptionKey:
+                        _systemPrompt = option.TextValue?.Trim() ?? string.Empty;
+                        break;
+                    case AttachScreenshotOptionKey:
+                        _attachScreenshot = option.Value;
+                        break;
+                    case CustomCommandsOptionKey:
+                        _customCommandsRaw = option.TextValue?.Trim() ?? string.Empty;
+                        _userCommands = ParseCustomCommands(_customCommandsRaw);
+                        break;
+                }
+            }
+        }
+
+        private ConfigurationSnapshot CaptureConfiguration()
+        {
+            lock (_sessionGate)
+            {
+                return new ConfigurationSnapshot(
+                    _provider,
+                    _primaryApiKey,
+                    _secondaryApiKey,
+                    _modelName,
+                    _maxTokens,
+                    _temperature,
+                    _timeoutSeconds,
+                    _ollamaHost,
+                    _systemPrompt,
+                    _attachScreenshot);
+            }
+        }
+
+        private List<Result> BuildQuickCommandResults(string rawQuery, string search)
+        {
+            var results = new List<Result>();
+            var filter = search.ToLowerInvariant();
+            var imageHint = _attachScreenshot ? " · 📎 Clipboard image" : string.Empty;
+
+            // Combine built-in and user commands
+            var allCommands = new List<(string Name, string Prompt, string Description)>(BuiltInCommands);
+            allCommands.AddRange(_userCommands);
+
+            // Pre-capture clipboard text once (used when no extra text is typed)
+            var clipboardText = CaptureClipboardText();
+            var clipboardHint = clipboardText != null
+                ? (clipboardText.Length > 60 ? clipboardText.Substring(0, 57) + "..." : clipboardText)
+                : null;
+
+            var score = 1000;
+            foreach (var (name, prompt, description) in allCommands)
+            {
+                // Show all commands for "/" or filter by typed prefix
+                if (filter == "/" || name.StartsWith(filter, StringComparison.OrdinalIgnoreCase))
+                {
+                    var commandPrompt = prompt;
+                    var subtitle = prompt;
+                    // If user typed extra text after the command name (e.g. "/translate to French"),
+                    // append it to the prompt
+                    var hasExtraText = false;
+                    if (search.Length > name.Length && search.StartsWith(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var extraText = search.Substring(name.Length).Trim();
+                        if (!string.IsNullOrEmpty(extraText))
+                        {
+                            commandPrompt = $"{prompt}: {extraText}";
+                            hasExtraText = true;
+                        }
+                    }
+
+                    // If no extra text typed, use clipboard text as input
+                    if (!hasExtraText && clipboardText != null)
+                    {
+                        commandPrompt = $"{prompt}: {clipboardText}";
+                        subtitle = $"{prompt} · 📋 \"{clipboardHint}\"";
+                    }
+
+                    var capturedPrompt = commandPrompt;
+                    var capturedRawQuery = rawQuery;
+                    results.Add(new Result
+                    {
+                        Title = $"{name}  —  {description}",
+                        SubTitle = $"{subtitle}{imageHint}  |  {_provider} · {_modelName}",
+                        IcoPath = _iconPath,
+                        Score = score--,
+                        Action = _ =>
+                        {
+                            StartQuery(capturedRawQuery, capturedPrompt);
+                            return false;
+                        }
+                    });
+                }
+            }
+
+            return results;
+        }
+
+        private static List<(string Name, string Prompt, string Description)> ParseCustomCommands(string raw)
+        {
+            var commands = new List<(string Name, string Prompt, string Description)>();
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return commands;
+            }
+
+            // Format: /name=prompt text; /name2=prompt text2
+            foreach (var entry in raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var eqIndex = entry.IndexOf('=');
+                if (eqIndex <= 0 || eqIndex >= entry.Length - 1)
+                {
+                    continue;
+                }
+
+                var name = entry.Substring(0, eqIndex).Trim();
+                var prompt = entry.Substring(eqIndex + 1).Trim();
+
+                if (!name.StartsWith("/", StringComparison.Ordinal))
+                {
+                    name = "/" + name;
+                }
+
+                if (!string.IsNullOrEmpty(prompt))
+                {
+                    commands.Add((name, prompt, $"⚡ {name.TrimStart('/')} (custom)"));
+                }
+            }
+
+            return commands;
+        }
+
+        private Result BuildInfoResult(string title, string subtitle, Func<bool>? action = null)
+        {
+            return new Result
+            {
+                Title = title,
+                SubTitle = subtitle,
+                IcoPath = _iconPath,
+                Action = action is null
+                    ? static _ => false
+                    : new Func<ActionContext, bool>(_ => action())
+            };
+        }
+
+        private IEnumerable<ApiKeyCandidate> EnumerateApiKeys(string? primary, string? secondary)
+        {
+            if (!string.IsNullOrWhiteSpace(primary))
+            {
+                yield return new ApiKeyCandidate(primary, ApiKeyKind.Primary);
+            }
+
+            if (!string.IsNullOrWhiteSpace(secondary))
+            {
+                if (!string.Equals(primary, secondary, StringComparison.Ordinal))
+                {
+                    yield return new ApiKeyCandidate(secondary, ApiKeyKind.Secondary);
+                }
+            }
+        }
+
+        private void ShowNotification(string message)
+        {
+            _context?.API?.ShowNotification(message);
+        }
+
+        private void ShowInfo(string title, string subtitle)
+        {
+            _context?.API?.ShowMsg(title, subtitle);
+        }
+
+        private enum ProviderSchemaType
+        {
+            OpenAI,
+            Cohere,
+            Google
+        }
+
+        private sealed record ProviderConfiguration(string Endpoint, ProviderSchemaType SchemaType);
+
+        private sealed record ConfigurationSnapshot(
+            string Provider,
+            string? PrimaryApiKey,
+            string? SecondaryApiKey,
+            string Model,
+            int MaxTokens,
+            double Temperature,
+            int TimeoutSeconds,
+            string OllamaHost,
+            string SystemPrompt,
+            bool AttachScreenshot);
+
+        private readonly record struct ApiKeyCandidate(string Key, ApiKeyKind Kind);
+
+        private enum ApiKeyKind
+        {
+            Primary,
+            Secondary
+        }
+
+        private sealed class StreamingSession : IDisposable
+        {
+            private readonly Main _owner;
+            private readonly object _sync = new();
+            private readonly StringBuilder _buffer = new();
+            private CancellationTokenSource _cts = new();
+            private string _prompt;
+            private string? _status;
+            private bool _hasError;
+            private bool _completed;
+
+            // Conversation history for follow-up questions: alternating user/assistant turns.
+            private readonly List<(string Role, string Content)> _history = new();
+
+            // UI Batching optimization
+            private int _chunksSinceLastRefresh = 0;
+            private const int ChunksPerRefresh = 3;  // Update UI every 3 chunks
+            private DateTime _lastRefreshTime = DateTime.UtcNow;
+            private static readonly TimeSpan MinRefreshInterval = TimeSpan.FromMilliseconds(150);
+
+            public StreamingSession(Main owner, string rawQuery, string prompt, string? imageBase64 = null)
+            {
+                _owner = owner;
+                RawQuery = rawQuery;
+                _prompt = prompt;
+                ImageBase64 = imageBase64;
+            }
+
+            public string RawQuery { get; }
+            public string? ImageBase64 { get; }
+            public event Action<string>? TokenReceived;
+
+            public CancellationToken Token
+            {
+                get
+                {
+                    lock (_sync)
+                    {
+                        return _cts.Token;
+                    }
+                }
+            }
+
+            public bool HasCompleted
+            {
+                get
+                {
+                    lock (_sync)
+                    {
+                        return _completed;
+                    }
+                }
+            }
+
+            public void Start()
+            {
+                _owner.BeginStreaming(this);
+            }
+
+            public void UpdatePrompt(string prompt)
+            {
+                var shouldRestart = false;
+
+                lock (_sync)
+                {
+                    if (!string.Equals(_prompt, prompt, StringComparison.Ordinal))
+                    {
+                        _prompt = prompt;
+                        shouldRestart = true;
+                    }
+                }
+
+                if (shouldRestart)
+                {
+                    Restart();
+                }
+            }
+
+            public void Restart()
+            {
+                lock (_sync)
+                {
+                    _cts.Cancel();
+                    _cts.Dispose();
+                    _cts = new CancellationTokenSource();
+                    _buffer.Clear();
+                    _status = null;
+                    _hasError = false;
+                    _completed = false;
+
+                    // Reset batching counters
+                    _chunksSinceLastRefresh = 0;
+                    _lastRefreshTime = DateTime.UtcNow;
+                }
+
+                _owner.BeginStreaming(this);
+            }
+
+            /// <summary>
+            /// Start a follow-up turn: archive the current turn into history,
+            /// adopt the new question as the active prompt, clear the buffer,
+            /// and kick off a fresh streaming request with the full conversation.
+            /// </summary>
+            public void StartFollowUp(string question)
+            {
+                lock (_sync)
+                {
+                    // If the previous turn produced a response, archive it as history.
+                    if (!_completed || _buffer.Length > 0)
+                    {
+                        RecordTurnIntoHistory();
+                    }
+
+                    _prompt = question;
+                    _cts.Cancel();
+                    _cts.Dispose();
+                    _cts = new CancellationTokenSource();
+                    _buffer.Clear();
+                    _status = null;
+                    _hasError = false;
+                    _completed = false;
+
+                    // Reset batching counters
+                    _chunksSinceLastRefresh = 0;
+                    _lastRefreshTime = DateTime.UtcNow;
+                }
+
+                _owner.BeginStreaming(this);
+            }
+
+            public void Cancel()
+            {
+                lock (_sync)
+                {
+                    _cts.Cancel();
+                }
+            }
+
+            public void Append(string text)
+            {
+                if (string.IsNullOrEmpty(text))
+                {
+                    return;
+                }
+
+                bool shouldRefresh = false;
+
+                lock (_sync)
+                {
+                    _buffer.Append(text);
+                    _status = null;
+                    _chunksSinceLastRefresh++;
+
+                    var timeSinceRefresh = DateTime.UtcNow - _lastRefreshTime;
+
+                    // Update UI if:
+                    // 1. Accumulated enough chunks (every 3 tokens) OR
+                    // 2. Enough time has passed (150ms for smoothness)
+                    if (_chunksSinceLastRefresh >= ChunksPerRefresh ||
+                        timeSinceRefresh >= MinRefreshInterval)
+                    {
+                        shouldRefresh = true;
+                        _chunksSinceLastRefresh = 0;
+                        _lastRefreshTime = DateTime.UtcNow;
+                    }
+                }
+
+                // Connect token received event
+                TokenReceived?.Invoke(text);
+
+                // Call refresh OUTSIDE of lock
+                if (shouldRefresh)
+                {
+                    _owner.TriggerRefresh(RawQuery);
+                }
+            }
+
+            public void MarkCompleted()
+            {
+                lock (_sync)
+                {
+                    _completed = true;
+                    RecordTurnIntoHistory();
+                }
+
+                // Notify window that streaming is complete
+                _owner.NotifyStreamingComplete();
+
+                // Always refresh UI when completed
+                _owner.TriggerRefresh(RawQuery);
+            }
+
+            /// <summary>
+            /// Record the current prompt/response pair into conversation history
+            /// so follow-up questions can carry context.
+            /// </summary>
+            private void RecordTurnIntoHistory()
+            {
+                if (string.IsNullOrWhiteSpace(_prompt))
+                {
+                    return;
+                }
+
+                var response = _buffer.ToString();
+                if (string.IsNullOrWhiteSpace(response))
+                {
+                    return;
+                }
+
+                // If the last recorded user message equals this prompt, treat it as an
+                // update of the same turn (re-ask) rather than a new turn.
+                if (_history.Count >= 2 &&
+                    _history[^2].Role == "user" &&
+                    string.Equals(_history[^2].Content, _prompt, StringComparison.Ordinal))
+                {
+                    _history[^1] = ("assistant", response);
+                    return;
+                }
+
+                _history.Add(("user", _prompt));
+                _history.Add(("assistant", response));
+            }
+
+            /// <summary>
+            /// Snapshot of the conversation history (user/assistant pairs).
+            /// </summary>
+            public List<(string Role, string Content)> SnapshotHistory()
+            {
+                lock (_sync)
+                {
+                    return new List<(string Role, string Content)>(_history);
+                }
+            }
+
+            /// <summary>
+            /// Whether the session currently has an in-flight request.
+            /// </summary>
+            public bool IsBusy
+            {
+                get
+                {
+                    lock (_sync)
+                    {
+                        return !_completed;
+                    }
+                }
+            }
+
+            public void SetStatus(string message)
+            {
+                lock (_sync)
+                {
+                    _status = message;
+                    _hasError = false;
+                }
+            }
+
+            public void SetError(string message)
+            {
+                lock (_sync)
+                {
+                    _status = message;
+                    _hasError = true;
+                }
+            }
+
+            public string SnapshotPrompt()
+            {
+                lock (_sync)
+                {
+                    return _prompt;
+                }
+            }
+
+            public string SnapshotResponse()
+            {
+                lock (_sync)
+                {
+                    return _buffer.ToString();
+                }
+            }
+
+            public Result BuildResult(string iconPath, string provider, string model)
+            {
+                lock (_sync)
+                {
+                    var responseText = _buffer.ToString();
+                    var title = string.Empty;
+                    var subtitle = string.Empty;
+
+                    if (_buffer.Length > 0)
+                    {
+                        // Split response into lines for better display
+                        var lines = responseText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+                        if (lines.Length > 0)
+                        {
+                            // Show first line as title
+                            title = lines[0].Length > 100 ? lines[0].Substring(0, 97) + "..." : lines[0];
+
+                            // Show second line or status as subtitle
+                            if (lines.Length > 1)
+                            {
+                                var secondLine = lines[1].Length > 80 ? lines[1].Substring(0, 77) + "..." : lines[1];
+                                subtitle = _completed 
+                                    ? $"{secondLine} | {provider} · {model}"
+                                    : $"{secondLine} | Streaming...";
+                            }
+                            else
+                            {
+                                subtitle = _completed
+                                    ? $"{provider} · {model}"
+                                    : "Streaming...";
+                            }
+                        }
+                        else
+                        {
+                            title = responseText.Length > 100 ? responseText.Substring(0, 97) + "..." : responseText;
+                            subtitle = _completed
+                                ? $"{provider} · {model}"
+                                : "Streaming...";
+                        }
+                    }
+                    else
+                    {
+                        title = _status ?? "Streaming response...";
+                        subtitle = _hasError
+                            ? "Request failed."
+                            : string.Format(CultureInfo.InvariantCulture, "{0} · {1}", provider, model);
+                    }
+
+                    return new Result
+                    {
+                        Title = title,
+                        SubTitle = subtitle,
+                        IcoPath = iconPath,
+                        Score = 100,
+                        Action = action => {
+                            _owner.OpenResultsWindow(this);
+                            return true;
+                        },
+                        ContextData = responseText
+                    };
+                }
+            }
+
+            public void Dispose()
+            {
+                lock (_sync)
+                {
+                    _cts.Cancel();
+                    _cts.Dispose();
+                }
+            }
+
+            private bool CopyToClipboard()
+            {
+                string text;
+
+                lock (_sync)
+                {
+                    text = _buffer.ToString();
+                }
+
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    Clipboard.SetText(text);
+                    _owner.ShowNotification("QuickAI response copied to clipboard.");
+                    return true;
+                }
+                catch (Exception)
+                {
+                    _owner.ShowInfo("QuickAI", "Unable to copy response to clipboard.");
+                    return false;
+                }
+            }
+        }
+    }
+}
