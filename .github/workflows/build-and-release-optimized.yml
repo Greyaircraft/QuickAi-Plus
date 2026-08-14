@@ -328,7 +328,7 @@ jobs:
 
       # OPTIMIZATION: Use latest release action with better performance
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: QuickAi v${{ steps.version.outputs.VERSION }}
           body: ${{ steps.notes.outputs.NOTES }}
